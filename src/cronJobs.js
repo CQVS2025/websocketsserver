@@ -116,22 +116,7 @@ export function startCronJobs(supabase, emitAlert) {
     }
   });
 
-  // Run initial scan after 30 seconds (server startup)
-  setTimeout(async () => {
-    console.log('[Cron] Running initial startup scan...');
-    try {
-      await scanStaleEntries(supabase, emitAlert);
-      await scanPendingOrders(supabase, emitAlert);
-      await scanDeviceHealth(supabase, emitAlert);
-      await scanChemicalLevels(supabase, emitAlert);
-      await scanRefillThresholds(supabase, emitAlert);
-      await scanUnusualConsumption(supabase, emitAlert);
-      await scanReportsDueToday(supabase, emitAlert);
-      await scanOverdueReports(supabase, emitAlert);
-    } catch (err) {
-      console.error('[Cron] Startup scan error:', err.message);
-    }
-  }, 30000);
+  console.log('[Cron] All scanners scheduled. No startup scan — crons will pick up within minutes.');
 }
 
 // ══════════════════════════════════════════════════════════════════
