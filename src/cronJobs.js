@@ -226,7 +226,7 @@ async function scanPendingOrders(supabase, emitAlert) {
     .limit(50);
 
   for (const order of pending || []) {
-    if (await wasRecentlyFired('ORDER_PENDING_APPROVAL', order.id, 12 * 60 * 60 * 1000)) continue;
+    if (await wasRecentlyFired('ORDER_PENDING_APPROVAL', order.id, 24 * 60 * 60 * 1000)) continue;
     const hours = Math.floor((Date.now() - new Date(order.created_at).getTime()) / (60 * 60 * 1000));
     await emitAlert({
       type: 'ORDER_PENDING_APPROVAL',
@@ -306,7 +306,7 @@ async function scanDeviceHealth(supabase, emitAlert) {
     const deviceLabel = `${device.site_ref} — ${device.device_ref || device.device_serial}`;
 
     if (offlineMs > extendedThresholdMs) {
-      if (await wasRecentlyFired('DEVICE_OFFLINE_EXTENDED', device.id, 4 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('DEVICE_OFFLINE_EXTENDED', device.id, 24 * 60 * 60 * 1000)) continue;
       const hours = Math.round(offlineMs / (60 * 60 * 1000));
       await emitAlert({
         type: 'DEVICE_OFFLINE_EXTENDED',
@@ -317,7 +317,7 @@ async function scanDeviceHealth(supabase, emitAlert) {
         message: `Device offline for more than ${hours} hours`,
       });
     } else if (offlineMs > offlineThresholdMs) {
-      if (await wasRecentlyFired('DEVICE_OFFLINE', device.id, 2 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('DEVICE_OFFLINE', device.id, 24 * 60 * 60 * 1000)) continue;
       const mins = Math.round(offlineMs / (60 * 1000));
       await emitAlert({
         type: 'DEVICE_OFFLINE',
@@ -349,7 +349,7 @@ async function scanDeviceHealth(supabase, emitAlert) {
             .eq('id', unresolvedOffline[0].id);
 
           // Fire back-online alert
-          if (!(await wasRecentlyFired('DEVICE_BACK_ONLINE', device.id, 2 * 60 * 60 * 1000))) {
+          if (!(await wasRecentlyFired('DEVICE_BACK_ONLINE', device.id, 24 * 60 * 60 * 1000))) {
             await emitAlert({
               type: 'DEVICE_BACK_ONLINE',
               category: 'devices',
@@ -566,7 +566,7 @@ async function scanChemicalLevels(supabase, emitAlert) {
     const criticalPct = Number(tank.critical_threshold_pct) || 10;
 
     if (percentage <= warningPct) {
-      if (await wasRecentlyFired('LOW_CHEMICAL_LEVEL', tank.id, 6 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('LOW_CHEMICAL_LEVEL', tank.id, 24 * 60 * 60 * 1000)) continue;
       await emitAlert({
         type: 'LOW_CHEMICAL_LEVEL',
         category: 'chemicals',
@@ -590,7 +590,7 @@ async function scanRefillThresholds(supabase, emitAlert) {
 
     // SITE_APPROACHING_REFILL — level between critical and warning threshold
     if (percentage > criticalPct && percentage <= warningPct) {
-      if (await wasRecentlyFired('SITE_APPROACHING_REFILL', tank.id, 12 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('SITE_APPROACHING_REFILL', tank.id, 24 * 60 * 60 * 1000)) continue;
       const daysMsg = daysRemaining != null ? ` (~${Math.round(daysRemaining)} days remaining)` : '';
       await emitAlert({
         type: 'SITE_APPROACHING_REFILL',
@@ -604,7 +604,7 @@ async function scanRefillThresholds(supabase, emitAlert) {
 
     // SITE_OVERDUE_REFILL — level at or below critical threshold
     if (percentage <= criticalPct) {
-      if (await wasRecentlyFired('SITE_OVERDUE_REFILL', tank.id, 8 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('SITE_OVERDUE_REFILL', tank.id, 24 * 60 * 60 * 1000)) continue;
       const daysMsg = daysRemaining != null ? ` (~${Math.round(daysRemaining)} days remaining)` : '';
       await emitAlert({
         type: 'SITE_OVERDUE_REFILL',
@@ -846,7 +846,7 @@ async function scanOverdueReports(supabase, emitAlert) {
     if (lastSentDate && lastSentDate >= lastExpected) continue; // Already sent
 
     if (lastExpected < today) {
-      if (await wasRecentlyFired('REPORT_OVERDUE', sched.id, 12 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('REPORT_OVERDUE', sched.id, 24 * 60 * 60 * 1000)) continue;
       const daysOverdue = Math.floor((today - lastExpected) / (24 * 60 * 60 * 1000));
       if (daysOverdue < 1) continue;
       await emitAlert({
