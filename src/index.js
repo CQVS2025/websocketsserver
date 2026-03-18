@@ -34,11 +34,30 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', connections: io.engine.clientsCount });
 });
 
+// In-memory dedup set — prevents duplicate alerts when multiple scanners or
+// the startup scan and first cron fire in quick succession.
+const _recentEmits = new Map(); // key → timestamp
+const MEMORY_DEDUP_WINDOW = 5 * 60 * 1000; // 5 minutes
+
+function cleanRecentEmits() {
+  const cutoff = Date.now() - MEMORY_DEDUP_WINDOW;
+  for (const [key, ts] of _recentEmits) {
+    if (ts < cutoff) _recentEmits.delete(key);
+  }
+}
+
 // ── Shared emit logic (used by both HTTP endpoint and cron jobs)
 async function emitAlert({ type, category, severity, entity_id, entity_name, message }) {
-  // Short-window dedup: skip if same type+entity was inserted in last 60 seconds
+  // In-memory dedup — catches same-cycle duplicates instantly (no DB round-trip)
+  const dedupKey = `${type}:${entity_id || entity_name || ''}`;
+  cleanRecentEmits();
+  if (_recentEmits.has(dedupKey)) {
+    return { skipped: true, reason: 'Duplicate alert suppressed (in-memory dedup)' };
+  }
+
+  // DB-backed dedup: skip if same type+entity was inserted in last 5 minutes
   try {
-    const since = new Date(Date.now() - 60 * 1000).toISOString();
+    const since = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     let dedupQuery = supabase
       .from('alerts')
       .select('id', { count: 'exact', head: true })
@@ -48,9 +67,13 @@ async function emitAlert({ type, category, severity, entity_id, entity_name, mes
     if (entity_name && !entity_id) dedupQuery = dedupQuery.eq('entity_name', entity_name);
     const { count: recentCount } = await dedupQuery;
     if ((recentCount || 0) > 0) {
-      return { skipped: true, reason: 'Duplicate alert suppressed (same type+entity within 60s)' };
+      _recentEmits.set(dedupKey, Date.now());
+      return { skipped: true, reason: 'Duplicate alert suppressed (same type+entity within 5m)' };
     }
   } catch (_) { /* proceed if dedup check fails */ }
+
+  // Mark as emitted BEFORE insert to prevent race conditions
+  _recentEmits.set(dedupKey, Date.now());
 
   // Look up alert configuration
   const { data: config } = await supabase

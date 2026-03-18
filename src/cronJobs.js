@@ -59,13 +59,16 @@ export function startCronJobs(supabase, emitAlert) {
   });
 
   // ══════════════════════════════════════════════════════════════
-  // EVERY 5 MINUTES — Device & Chemical monitoring
+  // EVERY 5 MINUTES — Device, Chemical & Delivery/Refill monitoring
   // ══════════════════════════════════════════════════════════════
   cron.schedule('*/5 * * * *', async () => {
-    console.log('[Cron] Running 5-min device/chemical scan...');
+    console.log('[Cron] Running 5-min device/chemical/refill scan...');
     try {
       await scanDeviceHealth(supabase, emitAlert);
+      // These 3 share a cached tank-level fetch (TANK_CACHE_TTL = 4 min)
       await scanChemicalLevels(supabase, emitAlert);
+      await scanRefillThresholds(supabase, emitAlert);
+      await scanUnusualConsumption(supabase, emitAlert);
     } catch (err) {
       console.error('[Cron] 5-min scan error:', err.message);
     }
@@ -121,6 +124,8 @@ export function startCronJobs(supabase, emitAlert) {
       await scanPendingOrders(supabase, emitAlert);
       await scanDeviceHealth(supabase, emitAlert);
       await scanChemicalLevels(supabase, emitAlert);
+      await scanRefillThresholds(supabase, emitAlert);
+      await scanUnusualConsumption(supabase, emitAlert);
       await scanReportsDueToday(supabase, emitAlert);
       await scanOverdueReports(supabase, emitAlert);
     } catch (err) {
@@ -145,7 +150,7 @@ async function scanStaleEntries(supabase, emitAlert) {
     .limit(50);
 
   for (const entry of stale || []) {
-    if (wasRecentlyFired('ENTRY_OPEN_5_DAYS', entry.id, 24 * 60 * 60 * 1000)) continue;
+    if (await wasRecentlyFired('ENTRY_OPEN_5_DAYS', entry.id, 24 * 60 * 60 * 1000)) continue;
     const days = Math.floor((Date.now() - new Date(entry.updated_at).getTime()) / (24 * 60 * 60 * 1000));
     await emitAlert({
       type: 'ENTRY_OPEN_5_DAYS',
@@ -192,7 +197,7 @@ async function scanInactiveAssignees(supabase, emitAlert) {
     if (!profile) continue;
     const lastSeen = presenceMap[profile.id];
     if (!lastSeen || new Date(lastSeen).getTime() < sevenDaysAgo) {
-      if (wasRecentlyFired('ENTRY_ASSIGNED_INACTIVE_USER', entry.id, 24 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('ENTRY_ASSIGNED_INACTIVE_USER', entry.id, 24 * 60 * 60 * 1000)) continue;
       await emitAlert({
         type: 'ENTRY_ASSIGNED_INACTIVE_USER',
         category: 'security',
@@ -221,7 +226,7 @@ async function scanPendingOrders(supabase, emitAlert) {
     .limit(50);
 
   for (const order of pending || []) {
-    if (wasRecentlyFired('ORDER_PENDING_APPROVAL', order.id, 12 * 60 * 60 * 1000)) continue;
+    if (await wasRecentlyFired('ORDER_PENDING_APPROVAL', order.id, 12 * 60 * 60 * 1000)) continue;
     const hours = Math.floor((Date.now() - new Date(order.created_at).getTime()) / (60 * 60 * 1000));
     await emitAlert({
       type: 'ORDER_PENDING_APPROVAL',
@@ -263,7 +268,7 @@ async function scanAgentPartsNeedOrder(supabase, emitAlert) {
 
   for (const s of stock) {
     if (usersWithOrders.has(s.user_id)) continue;
-    if (wasRecentlyFired('AGENT_PARTS_NO_REQUEST', s.user_id, 24 * 60 * 60 * 1000)) continue;
+    if (await wasRecentlyFired('AGENT_PARTS_NO_REQUEST', s.user_id, 24 * 60 * 60 * 1000)) continue;
     const agentName = nameMap[s.user_id] || 'Unknown agent';
     await emitAlert({
       type: 'AGENT_PARTS_NO_REQUEST',
@@ -298,56 +303,349 @@ async function scanDeviceHealth(supabase, emitAlert) {
   for (const device of configs) {
     const lastUpdate = new Date(device.updated_at).getTime();
     const offlineMs = now - lastUpdate;
+    const deviceLabel = `${device.site_ref} — ${device.device_ref || device.device_serial}`;
 
     if (offlineMs > extendedThresholdMs) {
-      if (wasRecentlyFired('DEVICE_OFFLINE_EXTENDED', device.id, 4 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('DEVICE_OFFLINE_EXTENDED', device.id, 4 * 60 * 60 * 1000)) continue;
       const hours = Math.round(offlineMs / (60 * 60 * 1000));
       await emitAlert({
         type: 'DEVICE_OFFLINE_EXTENDED',
         category: 'devices',
         severity: 'critical',
         entity_id: device.id,
-        entity_name: `${device.site_ref} — ${device.device_ref || device.device_serial}`,
+        entity_name: deviceLabel,
         message: `Device offline for more than ${hours} hours`,
       });
     } else if (offlineMs > offlineThresholdMs) {
-      if (wasRecentlyFired('DEVICE_OFFLINE', device.id, 2 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('DEVICE_OFFLINE', device.id, 2 * 60 * 60 * 1000)) continue;
       const mins = Math.round(offlineMs / (60 * 1000));
       await emitAlert({
         type: 'DEVICE_OFFLINE',
         category: 'devices',
         severity: 'critical',
         entity_id: device.id,
-        entity_name: `${device.site_ref} — ${device.device_ref || device.device_serial}`,
+        entity_name: deviceLabel,
         message: `Device not responding for ${mins} minutes`,
       });
+    } else {
+      // Device is online — check if it was previously offline and fire DEVICE_BACK_ONLINE
+      // Look for a recent DEVICE_OFFLINE or DEVICE_OFFLINE_EXTENDED alert for this device
+      // that hasn't been resolved yet
+      try {
+        const { data: unresolvedOffline } = await supabase
+          .from('alerts')
+          .select('id, type')
+          .eq('entity_id', device.id)
+          .in('type', ['DEVICE_OFFLINE', 'DEVICE_OFFLINE_EXTENDED'])
+          .eq('status', 'active')
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        if (unresolvedOffline?.length > 0) {
+          // Mark the offline alert as resolved
+          await supabase
+            .from('alerts')
+            .update({ status: 'resolved', resolved_at: new Date().toISOString() })
+            .eq('id', unresolvedOffline[0].id);
+
+          // Fire back-online alert
+          if (!(await wasRecentlyFired('DEVICE_BACK_ONLINE', device.id, 2 * 60 * 60 * 1000))) {
+            await emitAlert({
+              type: 'DEVICE_BACK_ONLINE',
+              category: 'devices',
+              severity: 'resolved',
+              entity_id: device.id,
+              entity_name: deviceLabel,
+              message: `Device is back online: ${deviceLabel}`,
+            });
+          }
+        }
+      } catch (err) {
+        console.warn('[Cron] Device back-online check failed:', err.message);
+      }
     }
   }
 }
 
 // ══════════════════════════════════════════════════════════════════
-// CHEMICAL / TANK LEVEL SCANNERS
+// CHEMICAL / TANK LEVEL + DELIVERY REFILL SCANNERS
 // ══════════════════════════════════════════════════════════════════
 
-async function scanChemicalLevels(supabase, emitAlert) {
-  // Check tank_configurations for warning/critical thresholds
-  // We look at the most recent readings
+/**
+ * Shared helper — fetches tank configs, refills, and scans from ELORA APIs,
+ * then computes the current level for each tank. Returns an array of tank
+ * level objects used by chemical, refill, and consumption scanners.
+ */
+async function computeAllTankLevels(supabase) {
   const { data: configs } = await supabase
     .from('tank_configurations')
-    .select('id, site_ref, device_ref, device_serial, product_type, tank_number, max_capacity_litres, warning_threshold_pct, critical_threshold_pct, active')
+    .select('id, site_ref, device_ref, device_serial, product_type, tank_number, max_capacity_litres, warning_threshold_pct, critical_threshold_pct, calibration_rate_per_60s, active')
     .eq('active', true)
     .limit(200);
 
-  if (!configs?.length) return;
+  if (!configs?.length) return [];
 
-  // For now, check if there's a recent chemical level reading via Supabase
-  // The actual level data typically comes from the device API
-  // We'll check for any low level alerts that haven't been raised
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supabaseUrl || !serviceKey) return [];
+
+  const toDate = new Date().toISOString().split('T')[0];
+  const fromDateScans = new Date(Date.now() - 730 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+  let refills = [];
+  let scans = [];
+  try {
+    const [refillsRes, scansRes] = await Promise.all([
+      fetch(`${supabaseUrl}/functions/v1/elora_refills`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${serviceKey}` },
+        body: JSON.stringify({ status: 'confirmed,delivered', fromDate: '2019-01-01', toDate }),
+      }).then(r => r.json()).catch(() => []),
+      fetch(`${supabaseUrl}/functions/v1/elora_scans`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${serviceKey}` },
+        body: JSON.stringify({ fromDate: fromDateScans, toDate, status: 'success,exceeded', export: true }),
+      }).then(r => r.json()).catch(() => []),
+    ]);
+    refills = Array.isArray(refillsRes) ? refillsRes : (refillsRes?.data ?? refillsRes?.refills ?? []);
+    scans = Array.isArray(scansRes) ? scansRes : (scansRes?.data ?? []);
+  } catch (err) {
+    console.warn('[Cron] Tank level fetch failed:', err.message);
+    return [];
+  }
+
+  if (!Array.isArray(refills)) refills = [];
+  if (!Array.isArray(scans)) scans = [];
+
+  // Filter only confirmed/delivered refills
+  refills = refills.filter(r => {
+    const status = (r.status || '').toLowerCase();
+    const statusId = r.statusId ?? r.status_id;
+    return status === 'confirmed' || status === 'delivered' || statusId === 2 || statusId === 3;
+  });
+
+  const results = [];
+
   for (const tank of configs) {
-    // We'll use the device serial to check recent readings if a readings table exists
-    // For now, this scanner is ready — when chemical reading data flows in,
-    // it will pick up tanks below threshold
-    // This is a placeholder that can be enhanced when reading data is available
+    try {
+      const siteRef = (tank.site_ref || '').trim();
+      const productType = (tank.product_type || '').toUpperCase();
+      const maxCapacity = Number(tank.max_capacity_litres) || 1000;
+      const calibration = Number(tank.calibration_rate_per_60s) || 0;
+
+      if (!calibration) {
+        results.push({ tank, status: 'NO_CALIBRATION' });
+        continue;
+      }
+
+      // Find refills for this site + product type
+      const siteRefills = refills.filter(r => {
+        const rSite = (r.siteRef ?? r.site_ref ?? r.site ?? r.siteName ?? '').toString().trim();
+        if (!siteRef || !rSite) return false;
+        if (rSite !== siteRef && !rSite.includes(siteRef) && !siteRef.includes(rSite)) return false;
+        if (productType) {
+          const rProduct = (r.productName ?? r.product ?? '').toString().toUpperCase();
+          const matchConc = (productType === 'ECSR' || productType === 'CONC') && (rProduct.includes('ECSR') || rProduct.includes('CONC') || rProduct.includes('ELORA-GAR'));
+          const matchFoam = productType === 'FOAM' && (rProduct.includes('FOAM') || rProduct.includes('ELORA-GAR'));
+          const matchTw = productType === 'TW' && (rProduct.includes('TRUCK WASH') || rProduct.includes('ETW') || rProduct.includes('TW-'));
+          const matchGel = productType === 'GEL' && rProduct.includes('GEL');
+          if (!matchConc && !matchFoam && !matchTw && !matchGel) return false;
+        }
+        return true;
+      }).sort((a, b) => {
+        const aDate = new Date(a.deliveredAt || a.dateTime || a.date || 0);
+        const bDate = new Date(b.deliveredAt || b.dateTime || b.date || 0);
+        return bDate - aDate;
+      });
+
+      const lastRefill = siteRefills[0];
+      if (!lastRefill) {
+        results.push({ tank, status: 'NO_REFILL' });
+        continue;
+      }
+
+      const refillDate = new Date(lastRefill.deliveredAt || lastRefill.dateTime || lastRefill.date);
+      const daysSinceRefill = (Date.now() - refillDate.getTime()) / (24 * 60 * 60 * 1000);
+      const deviceSerial = (tank.device_serial || '').trim();
+
+      // Scans since last refill for this device
+      const scansSinceRefill = scans.filter(s => {
+        const scanDate = new Date(s.createdAt || s.created_at);
+        if (scanDate < refillDate) return false;
+        const scanSerial = (s.computerSerialId || s.deviceSerial || s.device_serial || '').toString().trim();
+        return scanSerial && deviceSerial && scanSerial === deviceSerial;
+      });
+
+      // Total consumption: (wash_time_seconds / 60) * calibration_rate
+      const totalConsumed = scansSinceRefill.reduce((sum, s) => {
+        const washTime = Number(s.washTime ?? s.wash_time) || 0;
+        return sum + (washTime / 60) * calibration;
+      }, 0);
+
+      const startingLevel = Number(lastRefill.newTotalLitres ?? lastRefill.new_total_litres ?? lastRefill.deliveredLitres ?? lastRefill.delivered_litres) || maxCapacity;
+      const effectiveCapacity = Math.max(maxCapacity, startingLevel);
+      const currentLitres = Math.max(0, Math.min(effectiveCapacity, startingLevel - totalConsumed));
+      const percentage = effectiveCapacity > 0 ? (currentLitres / effectiveCapacity) * 100 : null;
+
+      // Average daily consumption (over the period since refill)
+      const avgDailyLitres = daysSinceRefill > 0.5 ? totalConsumed / daysSinceRefill : 0;
+      const daysRemaining = avgDailyLitres > 0 && currentLitres > 0 ? currentLitres / avgDailyLitres : null;
+
+      // 7-day rolling average for anomaly detection
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const recentScans = scansSinceRefill.filter(s => new Date(s.createdAt || s.created_at) >= sevenDaysAgo);
+      const recentConsumed = recentScans.reduce((sum, s) => {
+        const washTime = Number(s.washTime ?? s.wash_time) || 0;
+        return sum + (washTime / 60) * calibration;
+      }, 0);
+      const avgDailyLitres7d = recentConsumed / 7;
+
+      // Previous 7-day window for comparison (day -14 to day -7)
+      const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+      const prevWindowScans = scansSinceRefill.filter(s => {
+        const d = new Date(s.createdAt || s.created_at);
+        return d >= fourteenDaysAgo && d < sevenDaysAgo;
+      });
+      const prevConsumed = prevWindowScans.reduce((sum, s) => {
+        const washTime = Number(s.washTime ?? s.wash_time) || 0;
+        return sum + (washTime / 60) * calibration;
+      }, 0);
+      const avgDailyLitresPrev7d = prevConsumed / 7;
+
+      const tankLabel = `${siteRef} — Tank ${tank.tank_number || 1} (${productType || 'Unknown'})`;
+
+      results.push({
+        tank,
+        tankLabel,
+        status: 'OK',
+        percentage,
+        currentLitres,
+        effectiveCapacity,
+        startingLevel,
+        totalConsumed,
+        avgDailyLitres,
+        avgDailyLitres7d,
+        avgDailyLitresPrev7d,
+        daysRemaining,
+        daysSinceRefill,
+        refillDate,
+        scansSinceRefill,
+      });
+    } catch (err) {
+      console.warn(`[Cron] Tank level calc failed for ${tank.id}:`, err.message);
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Shared tank data cache — reused across chemical/refill/consumption scanners
+ * within the same cron cycle. Cleared after each cycle.
+ */
+let _tankLevelCache = null;
+let _tankLevelCacheTime = 0;
+const TANK_CACHE_TTL = 4 * 60 * 1000; // 4 minutes (scanners run every 5 min)
+
+async function getTankLevels(supabase) {
+  if (_tankLevelCache && (Date.now() - _tankLevelCacheTime) < TANK_CACHE_TTL) {
+    return _tankLevelCache;
+  }
+  _tankLevelCache = await computeAllTankLevels(supabase);
+  _tankLevelCacheTime = Date.now();
+  return _tankLevelCache;
+}
+
+async function scanChemicalLevels(supabase, emitAlert) {
+  const levels = await getTankLevels(supabase);
+
+  for (const entry of levels) {
+    if (entry.status !== 'OK' || entry.percentage == null) continue;
+    const { tank, tankLabel, percentage, currentLitres, effectiveCapacity } = entry;
+    const warningPct = Number(tank.warning_threshold_pct) || 20;
+    const criticalPct = Number(tank.critical_threshold_pct) || 10;
+
+    if (percentage <= warningPct) {
+      if (await wasRecentlyFired('LOW_CHEMICAL_LEVEL', tank.id, 6 * 60 * 60 * 1000)) continue;
+      await emitAlert({
+        type: 'LOW_CHEMICAL_LEVEL',
+        category: 'chemicals',
+        severity: percentage <= criticalPct ? 'critical' : 'warning',
+        entity_id: tank.id,
+        entity_name: tankLabel,
+        message: `Chemical level at ${Math.round(percentage)}% (${Math.round(currentLitres)}L / ${effectiveCapacity}L)`,
+      });
+    }
+  }
+}
+
+async function scanRefillThresholds(supabase, emitAlert) {
+  const levels = await getTankLevels(supabase);
+
+  for (const entry of levels) {
+    if (entry.status !== 'OK' || entry.percentage == null) continue;
+    const { tank, tankLabel, percentage, currentLitres, effectiveCapacity, daysRemaining } = entry;
+    const warningPct = Number(tank.warning_threshold_pct) || 20;
+    const criticalPct = Number(tank.critical_threshold_pct) || 10;
+
+    // SITE_APPROACHING_REFILL — level between critical and warning threshold
+    if (percentage > criticalPct && percentage <= warningPct) {
+      if (await wasRecentlyFired('SITE_APPROACHING_REFILL', tank.id, 12 * 60 * 60 * 1000)) continue;
+      const daysMsg = daysRemaining != null ? ` (~${Math.round(daysRemaining)} days remaining)` : '';
+      await emitAlert({
+        type: 'SITE_APPROACHING_REFILL',
+        category: 'delivery',
+        severity: 'warning',
+        entity_id: tank.id,
+        entity_name: tankLabel,
+        message: `Tank at ${Math.round(percentage)}% (${Math.round(currentLitres)}L / ${effectiveCapacity}L)${daysMsg} — approaching refill threshold`,
+      });
+    }
+
+    // SITE_OVERDUE_REFILL — level at or below critical threshold
+    if (percentage <= criticalPct) {
+      if (await wasRecentlyFired('SITE_OVERDUE_REFILL', tank.id, 8 * 60 * 60 * 1000)) continue;
+      const daysMsg = daysRemaining != null ? ` (~${Math.round(daysRemaining)} days remaining)` : '';
+      await emitAlert({
+        type: 'SITE_OVERDUE_REFILL',
+        category: 'delivery',
+        severity: 'critical',
+        entity_id: tank.id,
+        entity_name: tankLabel,
+        message: `Tank critically low at ${Math.round(percentage)}% (${Math.round(currentLitres)}L / ${effectiveCapacity}L)${daysMsg} — overdue for refill`,
+      });
+    }
+  }
+}
+
+async function scanUnusualConsumption(supabase, emitAlert) {
+  const levels = await getTankLevels(supabase);
+
+  for (const entry of levels) {
+    if (entry.status !== 'OK') continue;
+    const { tank, tankLabel, avgDailyLitres7d, avgDailyLitresPrev7d, daysSinceRefill } = entry;
+
+    // Need at least 10 days of data (7-day current window + 7-day prior window overlap with refill)
+    if (daysSinceRefill < 10) continue;
+    // Need meaningful baseline consumption (at least 1 litre/day in prior period)
+    if (avgDailyLitresPrev7d < 1) continue;
+    // Need current consumption to be non-trivial
+    if (avgDailyLitres7d < 1) continue;
+
+    // Flag if current 7-day average is ≥50% higher than prior 7-day average
+    const deviationPct = ((avgDailyLitres7d - avgDailyLitresPrev7d) / avgDailyLitresPrev7d) * 100;
+
+    if (deviationPct >= 50) {
+      if (await wasRecentlyFired('UNUSUAL_CONSUMPTION', tank.id, 24 * 60 * 60 * 1000)) continue;
+      await emitAlert({
+        type: 'UNUSUAL_CONSUMPTION',
+        category: 'delivery',
+        severity: 'warning',
+        entity_id: tank.id,
+        entity_name: tankLabel,
+        message: `Consumption up ${Math.round(deviationPct)}% — averaging ${Math.round(avgDailyLitres7d)}L/day vs ${Math.round(avgDailyLitresPrev7d)}L/day prior week`,
+      });
+    }
   }
 }
 
@@ -370,7 +668,7 @@ async function scanDeliveriesToday(supabase, emitAlert) {
     .limit(50);
 
   if (count > 0) {
-    if (wasRecentlyFired('DELIVERY_SCHEDULED_TODAY', 'digest', 20 * 60 * 60 * 1000)) return;
+    if (await wasRecentlyFired('DELIVERY_SCHEDULED_TODAY', 'digest', 20 * 60 * 60 * 1000)) return;
     const sites = (deliveries || []).map(d => d.site || d.customer).filter(Boolean).slice(0, 5).join(', ');
     await emitAlert({
       type: 'DELIVERY_SCHEDULED_TODAY',
@@ -404,7 +702,7 @@ async function scanNoDeliveryAtSite(supabase, emitAlert) {
       .eq('archived', false);
 
     if ((count || 0) === 0) {
-      if (wasRecentlyFired('SITE_NO_DELIVERY', siteRef, 24 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('SITE_NO_DELIVERY', siteRef, 24 * 60 * 60 * 1000)) continue;
       await emitAlert({
         type: 'SITE_NO_DELIVERY',
         category: 'delivery',
@@ -442,7 +740,7 @@ async function scanAreaManagerInactive(supabase, emitAlert) {
   for (const mgr of managers) {
     const lastSeen = presenceMap[mgr.id];
     if (!lastSeen || new Date(lastSeen).getTime() < sevenDaysAgo) {
-      if (wasRecentlyFired('MANAGER_NOT_LOGGED_IN_7_DAYS', mgr.id, 24 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('MANAGER_NOT_LOGGED_IN_7_DAYS', mgr.id, 24 * 60 * 60 * 1000)) continue;
       const days = lastSeen
         ? Math.floor((Date.now() - new Date(lastSeen).getTime()) / (24 * 60 * 60 * 1000))
         : 'unknown';
@@ -485,11 +783,11 @@ async function scanReportsDueToday(supabase, emitAlert) {
       if (lastSentDate === today) continue;
     }
 
-    if (wasRecentlyFired('REPORT_DUE_TODAY', sched.id, 20 * 60 * 60 * 1000)) continue;
+    if (await wasRecentlyFired('REPORT_DUE_TODAY', sched.id, 20 * 60 * 60 * 1000)) continue;
     await emitAlert({
       type: 'REPORT_DUE_TODAY',
       category: 'report_scheduling',
-      severity: 'warning',
+      severity: 'critical',
       entity_id: sched.id,
       entity_name: sched.contact_name || sched.email || 'Unknown',
       message: `Report due today for ${sched.contact_name || sched.email} — not yet marked sent`,
@@ -515,7 +813,7 @@ async function scanReportsDueSoon(supabase, emitAlert) {
     const isDue = isReportDueToday(sched, targetDate, targetDayOfWeek);
     if (!isDue) continue;
 
-    if (wasRecentlyFired('REPORT_DUE_IN_X_DAYS', sched.id, 24 * 60 * 60 * 1000)) continue;
+    if (await wasRecentlyFired('REPORT_DUE_IN_X_DAYS', sched.id, 24 * 60 * 60 * 1000)) continue;
     await emitAlert({
       type: 'REPORT_DUE_IN_X_DAYS',
       category: 'report_scheduling',
@@ -530,7 +828,6 @@ async function scanReportsDueSoon(supabase, emitAlert) {
 async function scanOverdueReports(supabase, emitAlert) {
   // Report overdue — due date passed, not marked sent
   const today = new Date();
-  const todayStr = today.toISOString().slice(0, 10);
 
   const { data: schedules } = await supabase
     .from('report_schedules')
@@ -549,7 +846,7 @@ async function scanOverdueReports(supabase, emitAlert) {
     if (lastSentDate && lastSentDate >= lastExpected) continue; // Already sent
 
     if (lastExpected < today) {
-      if (wasRecentlyFired('REPORT_OVERDUE', sched.id, 12 * 60 * 60 * 1000)) continue;
+      if (await wasRecentlyFired('REPORT_OVERDUE', sched.id, 12 * 60 * 60 * 1000)) continue;
       const daysOverdue = Math.floor((today - lastExpected) / (24 * 60 * 60 * 1000));
       if (daysOverdue < 1) continue;
       await emitAlert({
@@ -584,7 +881,7 @@ async function scanCompanyNoSchedule(supabase, emitAlert) {
 
   for (const company of companies) {
     if (companiesWithSchedule.has(company.id)) continue;
-    if (wasRecentlyFired('COMPANY_NO_REPORT_SCHEDULE', company.id, 7 * 24 * 60 * 60 * 1000)) continue;
+    if (await wasRecentlyFired('COMPANY_NO_REPORT_SCHEDULE', company.id, 7 * 24 * 60 * 60 * 1000)) continue;
     await emitAlert({
       type: 'COMPANY_NO_REPORT_SCHEDULE',
       category: 'report_scheduling',
@@ -606,7 +903,7 @@ async function scanScheduleNoReports(supabase, emitAlert) {
 
   for (const sched of schedules || []) {
     if (sched.report_types && sched.report_types.length > 0) continue;
-    if (wasRecentlyFired('SCHEDULE_NO_REPORTS', sched.id, 7 * 24 * 60 * 60 * 1000)) continue;
+    if (await wasRecentlyFired('SCHEDULE_NO_REPORTS', sched.id, 7 * 24 * 60 * 60 * 1000)) continue;
     await emitAlert({
       type: 'SCHEDULE_NO_REPORTS',
       category: 'report_scheduling',
@@ -649,7 +946,7 @@ async function scanWeeklyReportDigest(supabase, emitAlert) {
   }
 
   if (dueThisWeek.length > 0) {
-    if (wasRecentlyFired('WEEKLY_REPORT_DIGEST', 'digest', 6 * 24 * 60 * 60 * 1000)) return;
+    if (await wasRecentlyFired('WEEKLY_REPORT_DIGEST', 'digest', 6 * 24 * 60 * 60 * 1000)) return;
     const summary = dueThisWeek.slice(0, 5).map(d =>
       `${d.contact_name || d.email} (${d.dueDay})`
     ).join(', ');
