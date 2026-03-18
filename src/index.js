@@ -118,19 +118,22 @@ async function emitAlert({ type, category, severity, entity_id, entity_name, mes
   // Collect notification results
   const notificationResults = { email: [], sms: [] };
 
-  // Send email/SMS notifications
+  // Send email/SMS notifications — merge recipients from ALL admin delivery settings
   if (config.email_enabled || config.sms_enabled) {
-    const { data: settings } = await supabase
+    const { data: allSettings } = await supabase
       .from('alert_delivery_settings')
-      .select('*')
-      .limit(1)
-      .single();
+      .select('*');
 
-    if (settings) {
-      // Email notifications
-      if (config.email_enabled && settings.email) {
-        const emails = settings.email.split(',').map(e => e.trim()).filter(Boolean);
-        for (const email of emails) {
+    if (allSettings && allSettings.length > 0) {
+      // Merge all unique emails from every admin's delivery settings
+      if (config.email_enabled) {
+        const allEmails = new Set();
+        for (const s of allSettings) {
+          if (s.email) {
+            s.email.split(',').map(e => e.trim()).filter(Boolean).forEach(e => allEmails.add(e.toLowerCase()));
+          }
+        }
+        for (const email of allEmails) {
           try {
             await sendAlertEmail(email, alert);
             notificationResults.email.push({ success: true, to: email });
@@ -142,33 +145,42 @@ async function emitAlert({ type, category, severity, entity_id, entity_name, mes
         }
       }
 
-      // SMS notifications
-      if (config.sms_enabled && settings.sms_number) {
-        // Check quiet hours
+      // Merge all unique phone numbers, respecting each admin's quiet hours individually
+      if (config.sms_enabled) {
         const now = new Date();
         const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-        let inQuietHours = false;
+        const sentNumbers = new Set();
 
-        if (settings.quiet_hours_start && settings.quiet_hours_end) {
-          const start = settings.quiet_hours_start;
-          const end = settings.quiet_hours_end;
-          if (start > end) {
-            inQuietHours = currentTime >= start || currentTime <= end;
-          } else {
-            inQuietHours = currentTime >= start && currentTime <= end;
+        for (const s of allSettings) {
+          if (!s.sms_number) continue;
+
+          // Check this admin's quiet hours
+          let inQuietHours = false;
+          if (s.quiet_hours_start && s.quiet_hours_end) {
+            const start = s.quiet_hours_start;
+            const end = s.quiet_hours_end;
+            if (start > end) {
+              inQuietHours = currentTime >= start || currentTime <= end;
+            } else {
+              inQuietHours = currentTime >= start && currentTime <= end;
+            }
           }
-        }
 
-        if (inQuietHours) {
-          notificationResults.sms.push({
-            success: false,
-            error: `SMS suppressed — quiet hours active (${settings.quiet_hours_start} to ${settings.quiet_hours_end})`,
-          });
-        } else {
-          const numbers = settings.sms_number.split(',').map(n => n.trim()).filter(Boolean);
+          const numbers = s.sms_number.split(',').map(n => n.trim()).filter(Boolean);
           for (const number of numbers) {
-            const result = await sendAlertSMS(number, alert);
-            notificationResults.sms.push(result);
+            if (sentNumbers.has(number)) continue; // skip duplicate numbers across admins
+            sentNumbers.add(number);
+
+            if (inQuietHours) {
+              notificationResults.sms.push({
+                success: false,
+                to: number,
+                error: `SMS suppressed — quiet hours active (${s.quiet_hours_start} to ${s.quiet_hours_end})`,
+              });
+            } else {
+              const result = await sendAlertSMS(number, alert);
+              notificationResults.sms.push(result);
+            }
           }
         }
       }
