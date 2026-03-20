@@ -13,25 +13,44 @@ import cron from 'node-cron';
 // Supabase ref — set in startCronJobs
 let _supabase = null;
 
+// Dedup window: 24 hours for ongoing conditions so each issue fires exactly once per day.
+const ONE_DAY = 24 * 60 * 60 * 1000;
+
 /**
  * Check if a similar alert was already created within the time window
  * by querying the alerts table. This survives server restarts.
  */
-async function wasRecentlyFired(type, entityId, windowMs = 6 * 60 * 60 * 1000) {
+async function wasRecentlyFired(type, entityId, windowMs = ONE_DAY) {
   if (!_supabase) return false;
   try {
     const since = new Date(Date.now() - windowMs).toISOString();
-    let query = _supabase
+
+    if (entityId && entityId !== 'global') {
+      // Check both entity_id and entity_name — some alerts store the identifier
+      // in entity_name (e.g. site ref) while the dedup call passes it as entityId.
+      const { count: byId } = await _supabase
+        .from('alerts')
+        .select('id', { count: 'exact', head: true })
+        .eq('type', type)
+        .gte('created_at', since)
+        .eq('entity_id', entityId);
+      if ((byId || 0) > 0) return true;
+
+      const { count: byName } = await _supabase
+        .from('alerts')
+        .select('id', { count: 'exact', head: true })
+        .eq('type', type)
+        .gte('created_at', since)
+        .eq('entity_name', entityId);
+      return (byName || 0) > 0;
+    }
+
+    // No entity filter — just check by type
+    const { count } = await _supabase
       .from('alerts')
       .select('id', { count: 'exact', head: true })
       .eq('type', type)
       .gte('created_at', since);
-
-    if (entityId && entityId !== 'global') {
-      query = query.eq('entity_id', entityId);
-    }
-
-    const { count } = await query;
     return (count || 0) > 0;
   } catch (err) {
     console.warn('[Cron] Dedup check failed:', err.message);
@@ -288,7 +307,7 @@ async function scanDeviceHealth(supabase, emitAlert) {
   for (const device of configs) {
     const lastUpdate = new Date(device.updated_at).getTime();
     const offlineMs = now - lastUpdate;
-    const deviceLabel = `${device.site_ref} — ${device.device_ref || device.device_serial}`;
+    const deviceLabel = `${device.site_ref} - ${device.device_ref || device.device_serial}`;
 
     if (offlineMs > extendedThresholdMs) {
       if (await wasRecentlyFired('DEVICE_OFFLINE_EXTENDED', device.id, 24 * 60 * 60 * 1000)) continue;
@@ -497,7 +516,7 @@ async function computeAllTankLevels(supabase) {
       }, 0);
       const avgDailyLitresPrev7d = prevConsumed / 7;
 
-      const tankLabel = `${siteRef} — Tank ${tank.tank_number || 1} (${productType || 'Unknown'})`;
+      const tankLabel = `${siteRef} - Tank ${tank.tank_number || 1} (${productType || 'Unknown'})`;
 
       results.push({
         tank,
@@ -583,7 +602,7 @@ async function scanRefillThresholds(supabase, emitAlert) {
         severity: 'warning',
         entity_id: tank.id,
         entity_name: tankLabel,
-        message: `Tank at ${Math.round(percentage)}% (${Math.round(currentLitres)}L / ${effectiveCapacity}L)${daysMsg} — approaching refill threshold`,
+        message: `Tank at ${Math.round(percentage)}% (${Math.round(currentLitres)}L / ${effectiveCapacity}L)${daysMsg} - approaching refill threshold`,
       });
     }
 
@@ -597,7 +616,7 @@ async function scanRefillThresholds(supabase, emitAlert) {
         severity: 'critical',
         entity_id: tank.id,
         entity_name: tankLabel,
-        message: `Tank critically low at ${Math.round(percentage)}% (${Math.round(currentLitres)}L / ${effectiveCapacity}L)${daysMsg} — overdue for refill`,
+        message: `Tank critically low at ${Math.round(percentage)}% (${Math.round(currentLitres)}L / ${effectiveCapacity}L)${daysMsg} - overdue for refill`,
       });
     }
   }
@@ -628,7 +647,7 @@ async function scanUnusualConsumption(supabase, emitAlert) {
         severity: 'warning',
         entity_id: tank.id,
         entity_name: tankLabel,
-        message: `Consumption up ${Math.round(deviationPct)}% — averaging ${Math.round(avgDailyLitres7d)}L/day vs ${Math.round(avgDailyLitresPrev7d)}L/day prior week`,
+        message: `Consumption up ${Math.round(deviationPct)}% - averaging ${Math.round(avgDailyLitres7d)}L/day vs ${Math.round(avgDailyLitresPrev7d)}L/day prior week`,
       });
     }
   }
@@ -775,7 +794,7 @@ async function scanReportsDueToday(supabase, emitAlert) {
       severity: 'critical',
       entity_id: sched.id,
       entity_name: sched.contact_name || sched.email || 'Unknown',
-      message: `Report due today for ${sched.contact_name || sched.email} — not yet marked sent`,
+      message: `Report due today for ${sched.contact_name || sched.email} - not yet marked sent`,
     });
   }
 }
@@ -840,7 +859,7 @@ async function scanOverdueReports(supabase, emitAlert) {
         severity: 'critical',
         entity_id: sched.id,
         entity_name: sched.contact_name || sched.email || 'Unknown',
-        message: `Report ${daysOverdue} day${daysOverdue > 1 ? 's' : ''} overdue for ${sched.contact_name || sched.email} — not marked sent`,
+        message: `Report ${daysOverdue} day${daysOverdue > 1 ? 's' : ''} overdue for ${sched.contact_name || sched.email} - not marked sent`,
       });
     }
   }

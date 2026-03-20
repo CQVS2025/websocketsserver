@@ -175,7 +175,7 @@ async function emitAlert({ type, category, severity, entity_id, entity_name, mes
               notificationResults.sms.push({
                 success: false,
                 to: number,
-                error: `SMS suppressed — quiet hours active (${s.quiet_hours_start} to ${s.quiet_hours_end})`,
+                error: `SMS suppressed - quiet hours active (${s.quiet_hours_start} to ${s.quiet_hours_end})`,
               });
             } else {
               const result = await sendAlertSMS(number, alert);
@@ -186,10 +186,10 @@ async function emitAlert({ type, category, severity, entity_id, entity_name, mes
       }
     } else {
       if (config.email_enabled) {
-        notificationResults.email.push({ success: false, error: 'No delivery settings configured — set email in Delivery Settings' });
+        notificationResults.email.push({ success: false, error: 'No delivery settings configured - set email in Delivery Settings' });
       }
       if (config.sms_enabled) {
-        notificationResults.sms.push({ success: false, error: 'No delivery settings configured — set SMS number in Delivery Settings' });
+        notificationResults.sms.push({ success: false, error: 'No delivery settings configured - set SMS number in Delivery Settings' });
       }
     }
   }
